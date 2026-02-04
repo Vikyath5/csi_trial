@@ -1,3 +1,6 @@
+import 'package:flutter/material.dart';
+import 'tactile_home.dart';
+
 class TactileEntry extends StatelessWidget {
   const TactileEntry({super.key});
 

@@ -1,15 +1,16 @@
 import 'package:flutter/material.dart';
+import 'package:provider/provider.dart';
 import 'router.dart';
+import 'session_controller.dart';
 
 class NeuroVisionApp extends StatelessWidget {
   const NeuroVisionApp({super.key});
 
   @override
   Widget build(BuildContext context) {
-    return MaterialApp(
-      title: 'NeuroVision',
-      debugShowCheckedModeBanner: false,
-      home: const AppRouter(),
+    return ChangeNotifierProvider(
+      create: (_) => SessionController()..loadMockSession(),
+      child: const AppRouter(),
     );
   }
 }
