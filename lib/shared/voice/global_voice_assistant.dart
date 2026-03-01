@@ -77,6 +77,14 @@ class _GlobalVoiceAssistantState extends State<GlobalVoiceAssistant> {
             _voice.speak('Opening Vision Mode');
             session.navigateTo(ActiveModule.vision);
             session.triggerCommand(GlobalCommand.describe);
+          } else if (action == 'toggleNavigation') {
+            // Make sure we're in vision mode first
+            _voice.speak('Turning on navigation guidance.');
+            session.navigateTo(ActiveModule.vision);
+            session.triggerCommand(GlobalCommand.toggleNavigation);
+          } else if (action == 'stop') {
+            _voice.speak('Stopping guidance.');
+            session.triggerCommand(GlobalCommand.toggleNavigation); // toggles off
           } else if (action == 'learning') {
             _voice.speak('Opening ADHD Learning Mode');
             session.navigateTo(ActiveModule.learning);

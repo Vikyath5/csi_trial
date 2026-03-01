@@ -13,7 +13,7 @@ import '../shared/models/progress_model.dart';
 enum ActiveModule { dashboard, learning, vision }
 
 /// Global signals for voice assistant and gestures
-enum GlobalCommand { describe, toggleContinuous, openMap }
+enum GlobalCommand { describe, toggleContinuous, openMap, toggleNavigation }
 
 class SessionController extends ChangeNotifier {
   // ── Pending Command Signaling ──
