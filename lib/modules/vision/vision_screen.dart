@@ -439,7 +439,7 @@ class _VisionScreenState extends State<VisionScreen>
                   )
                 ),
                 Text(
-                  _isMapMode || _logic.isNavigationMode ? 'Navigating route' : '$_sceneDescription ($_objectCount items)',
+                  _isMapMode || _logic.isNavigationGuidanceActive ? 'Navigating route' : '$_sceneDescription ($_objectCount items)',
                   style: theme.textTheme.bodySmall?.copyWith(color: NVColors.textSecondary)
                 ),
               ],
