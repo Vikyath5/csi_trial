@@ -45,6 +45,13 @@ class DetectedObject {
   String get displayLabel => label.isNotEmpty
       ? '${label[0].toUpperCase()}${label.substring(1)}'
       : 'Unknown';
+
+  /// Estimated relative area of object in frame (0.0–1.0)
+  /// Used to estimate distance: larger area = closer object
+  double areaRatio(double frameW, double frameH) {
+    if (boundingBox == Rect.zero || frameW <= 0 || frameH <= 0) return 0;
+    return (boundingBox.width * boundingBox.height) / (frameW * frameH);
+  }
 }
 
 /// Scene context based on detected objects
@@ -54,6 +61,34 @@ enum SceneContext {
   outdoor,
   indoor,
   unknown,
+}
+
+/// Spatial zone of screen (for navigation guidance)
+enum ObjectZone { left, center, right, unknown }
+
+/// How close an object is — estimated from bounding box size
+enum ProximityZone {
+  safe,     // >2.5m — silent, don't interrupt
+  warning,  // ~2m   — mention once
+  danger,   // ~1.5m — give direction
+  critical, // <1m   — STOP command
+}
+
+/// Navigation guidance instruction
+class NavGuidance {
+  final String voice;          // Spoken direction
+  final ObjectZone zone;       // Where the object is
+  final bool isDanger;         // Is it a dangerous object?
+  final String objectName;     // What was detected
+  final ProximityZone proximity; // How close
+
+  const NavGuidance({
+    required this.voice,
+    required this.zone,
+    required this.isDanger,
+    required this.objectName,
+    this.proximity = ProximityZone.warning,
+  });
 }
 
 class VisionLogic {
@@ -71,6 +106,12 @@ class VisionLogic {
   bool _isDetecting = false;
   bool _detectionActive = false;
 
+  // ── Stability filter: tracks consecutive hits per label ──
+  final Map<String, int> _labelHitCount = {};
+  static const int _stabilityFrames = 3; // Must appear N frames before announcing
+  static const double _mlKitConfidence = 0.65; // Raised threshold
+  static const double _labelerConfidence = 0.70;
+
   // ── YOLO Object Detection ──
   final FlutterVision _vision = FlutterVision();
   bool _yoloLoaded = false;
@@ -81,11 +122,25 @@ class VisionLogic {
   bool _isSpeaking = false;
   DateTime _lastAnnouncement = DateTime.now();
   DateTime _lastDangerAnnouncement = DateTime.now();
+  DateTime _lastNavAnnouncement = DateTime.now();
 
   // ── Continuous narration mode ──
   bool _continuousMode = false;
   Timer? _narrationTimer;
   static const Duration _narrationInterval = Duration(seconds: 3);
+  static const Duration _navInterval = Duration(seconds: 3);
+
+  // ── Navigation mode ──
+  bool _navigationGuidanceActive = false;
+  NavGuidance? _lastGuidance;
+
+  // ── Structural obstacle proximity tracking ──
+  // Counts consecutive frames each structural label has been detected.
+  // More frames = user is walking closer → escalates proximity zone.
+  final Map<String, int> _structuralFrameCounts = {};
+  static const int _structuralWarningFrames  = 4;  // ~2m: warn once
+  static const int _structuralDangerFrames   = 10; // ~1.5m: give direction
+  static const int _structuralCriticalFrames = 18; // <1m: STOP!
 
   // ── Detection state ──
   List<DetectedObject> _currentDetections = [];
@@ -95,6 +150,7 @@ class VisionLogic {
   // ── Callbacks ──
   void Function(List<DetectedObject>)? onDetectionUpdate;
   void Function(String)? onSceneUpdate;
+  void Function(NavGuidance)? onNavigationGuidance;
 
   // ── Getters ──
   bool get isCameraReady => _cameraInitialized;
@@ -103,9 +159,11 @@ class VisionLogic {
   bool get isSpeaking => _isSpeaking;
   bool get useYOLO => _useYOLO;
   bool get yoloLoaded => _yoloLoaded;
+  bool get isNavigationGuidanceActive => _navigationGuidanceActive;
   List<DetectedObject> get currentDetections => _currentDetections;
   SceneContext get currentScene => _currentScene;
   String get sceneDescription => _sceneDescription;
+  NavGuidance? get lastGuidance => _lastGuidance;
 
   // ──────────────────────────────────
   // Camera Initialization
@@ -208,7 +266,7 @@ class VisionLogic {
   /// Initializes ML Kit image labeler (for comprehensive object list)
   Future<void> initializeImageLabeler() async {
     try {
-      final options = ImageLabelerOptions(confidenceThreshold: 0.5);
+      final options = ImageLabelerOptions(confidenceThreshold: _labelerConfidence);
       _imageLabeler = ImageLabeler(options: options);
       debugPrint('[VisionLogic] ML Kit Image Labeler initialized');
     } catch (e) {
@@ -302,32 +360,60 @@ class VisionLogic {
           final objects = await _objectDetector!.processImage(inputImage);
           for (final obj in objects) {
             for (final label in obj.labels) {
-              if (label.confidence >= 0.4) {
+              // ── Higher confidence threshold to reduce false positives ──
+              if (label.confidence >= _mlKitConfidence) {
+                final key = label.text.toLowerCase();
+                _labelHitCount[key] = (_labelHitCount[key] ?? 0) + 1;
+                // ── Stability filter: only report after N consecutive frames ──
+                if ((_labelHitCount[key] ?? 0) >= _stabilityFrames) {
+                  detections.add(DetectedObject(
+                    label: label.text,
+                    confidence: label.confidence,
+                    boundingBox: obj.boundingBox,
+                  ));
+                }
+              }
+            }
+          }
+        }
+
+        // 2. Image Labeler — scene context ONLY, never for navigation
+        // We deliberately exclude body parts, colors, textures — they are not obstacles
+        const _navBlocklist = {
+          'skin', 'face', 'hand', 'arm', 'leg', 'finger', 'thumb', 'nose',
+          'eye', 'hair', 'neck', 'shoulder', 'ear', 'mouth', 'lip', 'cheek',
+          'head', 'forehead', 'eyebrow', 'chin', 'palm', 'wrist', 'elbow',
+          'blue', 'red', 'green', 'yellow', 'black', 'white', 'color', 'texture',
+          'pattern', 'wood', 'metal', 'plastic', 'fabric', 'material', 'surface',
+          'light', 'shadow', 'darkness', 'blur', 'close-up', 'macro',
+          'organ', 'joint', 'limb', 'trunk', 'torso',
+        };
+        if (_imageLabeler != null) {
+          final labels = await _imageLabeler!.processImage(inputImage);
+          for (final label in labels) {
+            final lowerLabel = label.label.toLowerCase();
+            // Skip body parts, colors, textures — they're not navigation obstacles
+            if (_navBlocklist.contains(lowerLabel)) continue;
+            if (label.confidence >= _labelerConfidence) {
+              if (!detections.any((d) => d.label.toLowerCase() == lowerLabel)) {
                 detections.add(DetectedObject(
-                  label: label.text,
+                  label: label.label,
                   confidence: label.confidence,
-                  boundingBox: obj.boundingBox,
+                  boundingBox: Rect.zero, // No spatial info from labeler
                 ));
               }
             }
           }
         }
 
-        // 2. Run Image Labeler (for "many more" objects like cars, plants, signs)
-        if (_imageLabeler != null) {
-          final labels = await _imageLabeler!.processImage(inputImage);
-          for (final label in labels) {
-            if (label.confidence >= 0.5) {
-              // Add if not already in detections
-              if (!detections.any((d) => d.label.toLowerCase() == label.label.toLowerCase())) {
-                detections.add(DetectedObject(
-                  label: label.label,
-                  confidence: label.confidence,
-                  boundingBox: Rect.zero, // Labels don't have boxes
-                ));
-              }
-            }
-          }
+        // Decay hit counts for labels NOT seen this frame
+        final seenKeys = detections.map((d) => d.label.toLowerCase()).toSet();
+        final toDecay = _labelHitCount.keys
+            .where((k) => !seenKeys.contains(k))
+            .toList();
+        for (final k in toDecay) {
+          _labelHitCount[k] = (_labelHitCount[k]! - 1).clamp(0, _stabilityFrames + 1);
+          if (_labelHitCount[k] == 0) _labelHitCount.remove(k);
         }
       }
 
@@ -336,21 +422,109 @@ class VisionLogic {
       _analyzeScene(detections);
       onDetectionUpdate?.call(detections);
 
-      // 1. URGENT SAFETY: Always speak if danger objects (car, truck) are detected
-      // even if continuous mode is OFF.
-      final dangerObjects = detections.where((d) => 
-        ['car', 'truck', 'bus', 'motorcycle', 'bicycle'].contains(d.label.toLowerCase())
-      ).toList();
-
       final now = DateTime.now();
-      if (dangerObjects.isNotEmpty && now.difference(_lastDangerAnnouncement) > const Duration(seconds: 4)) {
-        _lastDangerAnnouncement = now;
-        final name = dangerObjects.first.displayLabel;
-        speak('Caution! $name nearby.');
-        Vibration.vibrate(duration: 500); // Strong haptic for danger
+
+      // ── 1. SPATIAL NAVIGATION GUIDANCE ──
+      if (_navigationGuidanceActive) {
+        if (now.difference(_lastNavAnnouncement) > _navInterval) {
+          _lastNavAnnouncement = now;
+
+          // Step 1: Real objects from ObjectDetector (have bounding boxes)
+          var navObjects = detections
+              .where((d) => d.boundingBox != Rect.zero)
+              .toList();
+
+          // Step 2: If no bounding-box objects found, check ImageLabeler output.
+          // Only synthesize obstacles for concrete structural things that block paths.
+          if (navObjects.isEmpty) {
+            final labelerHits = detections
+                .where((d) => d.boundingBox == Rect.zero)
+                .toList();
+
+            if (labelerHits.isNotEmpty) {
+              // Only REAL physical obstacles — absolutely NO roads, floors, or safe ground
+              const blockingLabels = {
+                'wall', 'door', 'stairs', 'staircase', 'step', 'steps',
+                'fence', 'gate', 'pillar', 'column', 'pole', 'post',
+                'glass', 'window', 'barrier', 'building',
+                'tree', 'plant', 'bush', 'shrub', 'branch',
+                'furniture', 'vehicle', 'person', 'people', 'human',
+                'car', 'truck', 'bus', 'animal', 'dog', 'cat',
+              };
+
+              DetectedObject? obstacle;
+              for (final d in labelerHits) {
+                if (blockingLabels.contains(d.label.toLowerCase())) {
+                  obstacle = d;
+                  break;
+                }
+              }
+
+              if (obstacle != null) {
+                final fw = image.width.toDouble();
+                final fh = image.height.toDouble();
+                // Synthesize a large center bounding box
+                navObjects = [
+                  DetectedObject(
+                    label: obstacle.label,
+                    confidence: obstacle.confidence,
+                    boundingBox: Rect.fromCenter(
+                      center: Offset(fw / 2, fh / 2),
+                      width: fw * 0.55,
+                      height: fh * 0.45,
+                    ),
+                  ),
+                ];
+              }
+            }
+          }
+
+          if (navObjects.isNotEmpty) {
+            final guidance = _computeNavigationGuidance(
+                navObjects, image.width.toDouble(), image.height.toDouble());
+            if (guidance != null) {
+              _lastGuidance = guidance;
+              onNavigationGuidance?.call(guidance);
+              speak(guidance.voice);
+              _vibrateForZone(guidance.zone, guidance.isDanger);
+            }
+          } else {
+            // Absolutely nothing detected — path is genuinely clear
+            if (_lastSpokenGuidance != 'Path clear. Go straight.') {
+              _lastSpokenGuidance = 'Path clear. Go straight.';
+              speak('Path clear. Go straight.');
+              onNavigationGuidance?.call(const NavGuidance(
+                voice: 'Path clear. Go straight.',
+                zone: ObjectZone.center,
+                isDanger: false,
+                objectName: '',
+              ));
+            }
+          }
+        }
       }
 
-      // 2. Continuous mode narration
+
+      // ── 2. URGENT SAFETY: danger objects always speak even without nav mode ──
+      final dangerObjects = detections.where((d) =>
+        ['car', 'truck', 'bus', 'motorcycle', 'bicycle']
+            .contains(d.label.toLowerCase())
+      ).toList();
+
+      if (dangerObjects.isNotEmpty &&
+          now.difference(_lastDangerAnnouncement) > const Duration(seconds: 4)) {
+        _lastDangerAnnouncement = now;
+        final name = dangerObjects.first.displayLabel;
+        final zone = _getZone(dangerObjects.first, image.width.toDouble());
+        final zoneWord = _zoneToWord(zone);
+        if (!_navigationGuidanceActive) {
+          // Only speak safety alert if nav guidance hasn't already spoken
+          speak('Caution! $name on your $zoneWord.');
+        }
+        Vibration.vibrate(duration: 600);
+      }
+
+      // ── 3. Continuous mode narration (scene description) ──
       if (_continuousMode && detections.isNotEmpty && !_isSpeaking) {
         if (now.difference(_lastAnnouncement) > _narrationInterval) {
           _lastAnnouncement = now;
@@ -420,8 +594,338 @@ class VisionLogic {
   }
 
   // ──────────────────────────────────
+  // Spatial Navigation Guidance
+  // ──────────────────────────────────
+
+  // Last spoken guidance text (to avoid repeating same sentence)
+  String _lastSpokenGuidance = '';
+
+  /// Enables or disables real-time spatial navigation guidance
+  void setNavigationGuidance(bool enabled) {
+    _navigationGuidanceActive = enabled;
+    if (enabled) {
+      _lastSpokenGuidance = '';
+      speak('Navigation guidance on. I will tell you where to go.');
+    } else {
+      speak('Navigation guidance off.');
+    }
+  }
+
+  /// Determines spatial zone of an object based on its bounding box center X
+  ObjectZone _getZone(DetectedObject obj, double frameWidth) {
+    if (obj.boundingBox == Rect.zero || frameWidth <= 0) return ObjectZone.unknown;
+    final centerX = obj.boundingBox.left + obj.boundingBox.width / 2;
+    final ratio = centerX / frameWidth;
+    if (ratio < 0.35) return ObjectZone.left;
+    if (ratio > 0.65) return ObjectZone.right;
+    return ObjectZone.center;
+  }
+
+  /// Human-readable zone word
+  String _zoneToWord(ObjectZone zone) {
+    switch (zone) {
+      case ObjectZone.left:    return 'left';
+      case ObjectZone.right:   return 'right';
+      case ObjectZone.center:  return 'center';
+      case ObjectZone.unknown: return 'ahead';
+    }
+  }
+
+  /// Vibration patterns per zone
+  Future<void> _vibrateForZone(ObjectZone zone, bool isDanger) async {
+    try {
+      if (isDanger) {
+        // Strong danger pulse
+        await Vibration.vibrate(pattern: [0, 300, 100, 300, 100, 300]);
+        return;
+      }
+      switch (zone) {
+        case ObjectZone.left:
+          // Single short left-side buzz
+          await Vibration.vibrate(pattern: [0, 200, 80, 100]);
+          break;
+        case ObjectZone.right:
+          // Double short right-side buzz
+          await Vibration.vibrate(pattern: [0, 100, 80, 200]);
+          break;
+        case ObjectZone.center:
+          // Long center warning
+          await Vibration.vibrate(duration: 400);
+          break;
+        case ObjectZone.unknown:
+          await Vibration.vibrate(duration: 150);
+          break;
+      }
+    } catch (_) {}
+  }
+
+  /// Computes navigation guidance — simple, always speaks, no silent zones
+  NavGuidance? _computeNavigationGuidance(
+      List<DetectedObject> detections, double frameWidth, [double frameHeight = 640]) {
+    final realObjects = detections.where((d) => d.boundingBox != Rect.zero).toList();
+    if (realObjects.isEmpty) return null;
+
+    final dangerLabels = {'car', 'truck', 'bus', 'motorcycle', 'bicycle', 'vehicle'};
+
+    // Sort by confidence, prioritise danger objects
+    final sorted = List<DetectedObject>.from(realObjects)
+      ..sort((a, b) => b.confidence.compareTo(a.confidence));
+
+    DetectedObject? primary;
+    bool isDanger = false;
+    for (final obj in sorted) {
+      if (dangerLabels.contains(obj.label.toLowerCase())) {
+        primary = obj;
+        isDanger = true;
+        break;
+      }
+    }
+    primary ??= sorted.first;
+    isDanger = dangerLabels.contains(primary.label.toLowerCase());
+
+    final zone  = _getZone(primary, frameWidth);
+    final name  = primary.displayLabel;
+    final area  = primary.areaRatio(frameWidth, frameHeight);
+
+    // Is the user's direct walking path (CENTER zone) clear?
+    final centerClear = !realObjects
+        .map((d) => _getZone(d, frameWidth))
+        .contains(ObjectZone.center);
+
+    String voice;
+
+    // ── STOP: object fills >25% of frame (very close, any zone) ──
+    if (area > 0.25 || (isDanger && area > 0.10)) {
+      voice = _pick(
+          isDanger
+            ? ['Stop! $name right in front!', 'Danger! Stop, $name is very close!']
+            : zone == ObjectZone.left
+                ? ['Stop! $name on your left, very close. Move right.']
+                : zone == ObjectZone.right
+                    ? ['Stop! $name on your right, very close. Move left.']
+                    : ['Stop! $name right in front. Move aside.']);
+
+    } else if (isDanger) {
+      // ── DANGER object — always warn regardless of zone ──
+      switch (zone) {
+        case ObjectZone.left:
+          voice = _pick(['Go right. $name on the left.', '$name on your left — move right.']);
+          break;
+        case ObjectZone.right:
+          voice = _pick(['Go left. $name on the right.', '$name on your right — move left.']);
+          break;
+        case ObjectZone.center:
+          final lc = !realObjects.map((d) => _getZone(d,frameWidth)).contains(ObjectZone.left);
+          final rc = !realObjects.map((d) => _getZone(d,frameWidth)).contains(ObjectZone.right);
+          voice = _pick(
+              lc  ? ['Go left. $name is straight ahead.', 'Turn left, $name ahead.']
+            : rc  ? ['Go right. $name is straight ahead.', 'Turn right, $name ahead.']
+            : ['Stop. $name ahead. Back up slowly.']);
+          break;
+        default:
+          voice = _pick(['$name nearby. Slow down.']);
+      }
+
+    } else if (zone == ObjectZone.center) {
+      // ── Non-danger CENTER object — always block, give direction ──
+      final lc = !realObjects.map((d) => _getZone(d,frameWidth)).contains(ObjectZone.left);
+      final rc = !realObjects.map((d) => _getZone(d,frameWidth)).contains(ObjectZone.right);
+      voice = _pick(
+          (lc && rc) ? ['$name ahead. Go left or right.', 'Something in the way — pick a side.']
+        : lc  ? ['Go left. $name is ahead.', '$name ahead — go left.']
+        : rc  ? ['Go right. $name is ahead.', '$name ahead — go right.']
+        : ['$name ahead. Path blocked. Slow down.']);
+
+    } else {
+      // ── Non-danger SIDE object (left or right) — CENTER path is clear ──
+      // Don't redirect the user — just warn and let them continue forward.
+      if (centerClear) {
+        // Path ahead is free — just inform, don't reroute
+        voice = _pick(
+            zone == ObjectZone.left
+              ? ['Path ahead is clear. $name on your left — keep going straight.', '$name on the left. Center path is free, go straight.']
+              : ['Path ahead is clear. $name on your right — keep going straight.', '$name on the right. Center path is free, go straight.']);
+      } else {
+        // Center is also blocked
+        voice = _pick(
+            zone == ObjectZone.left
+              ? ['$name on your left. Watch out.']
+              : ['$name on your right. Watch out.']);
+      }
+    }
+
+    // Don't repeat the exact same sentence twice in a row
+    if (voice == _lastSpokenGuidance) return null;
+    _lastSpokenGuidance = voice;
+
+    return NavGuidance(
+      voice: voice,
+      zone: zone,
+      isDanger: isDanger,
+      objectName: name,
+    );
+  }
+
+  /// Picks a random phrase from a list for natural-sounding speech
+  String _pick(List<String> options) {
+    if (options.length == 1) return options.first;
+    return options[(DateTime.now().millisecondsSinceEpoch % options.length).toInt()];
+  }
+
+  // ──────────────────────────────────────────────────────
+  // Navigation Test Scenarios (for verifying behaviour)
+  // ──────────────────────────────────────────────────────
+
+  /// Call this from the debug panel to test a specific nav scenario.
+  /// [scenario]: 'wall', 'person_left', 'person_right', 'car_ahead',
+  ///             'car_left', 'car_right', 'clear', 'blocked'
+  void testNavScenario(String scenario) {
+    // Frame dimensions used for synthetic bounding boxes
+    const double fw = 640, fh = 480;
+
+    List<DetectedObject> fakeObjects = [];
+
+    switch (scenario) {
+      case 'wall':
+        // Large surface filling center — synthetic labeler hit as "Surface"
+        fakeObjects = [
+          DetectedObject(
+            label: 'Surface',
+            confidence: 0.95,
+            boundingBox: Rect.fromCenter(
+              center: const Offset(fw / 2, fh / 2),
+              width: fw * 0.55, height: fh * 0.45,
+            ),
+          ),
+        ];
+        break;
+
+      case 'person_left':
+        fakeObjects = [
+          DetectedObject(
+            label: 'Person',
+            confidence: 0.88,
+            boundingBox: const Rect.fromLTWH(20, 80, 160, 300),  // left zone
+          ),
+        ];
+        break;
+
+      case 'person_right':
+        fakeObjects = [
+          DetectedObject(
+            label: 'Person',
+            confidence: 0.88,
+            boundingBox: const Rect.fromLTWH(460, 80, 160, 300), // right zone
+          ),
+        ];
+        break;
+
+      case 'car_ahead':
+        fakeObjects = [
+          DetectedObject(
+            label: 'Car',
+            confidence: 0.92,
+            boundingBox: const Rect.fromLTWH(200, 150, 240, 180), // center
+          ),
+        ];
+        break;
+
+      case 'car_left':
+        fakeObjects = [
+          DetectedObject(
+            label: 'Car',
+            confidence: 0.90,
+            boundingBox: const Rect.fromLTWH(10, 100, 200, 200), // left
+          ),
+        ];
+        break;
+
+      case 'car_right':
+        fakeObjects = [
+          DetectedObject(
+            label: 'Car',
+            confidence: 0.90,
+            boundingBox: const Rect.fromLTWH(430, 100, 200, 200), // right
+          ),
+        ];
+        break;
+
+      case 'blocked':
+        // Objects on left, center, right — all blocked
+        fakeObjects = [
+          DetectedObject(label: 'Chair', confidence: 0.85,
+              boundingBox: const Rect.fromLTWH(20, 100, 150, 200)),
+          DetectedObject(label: 'Person', confidence: 0.88,
+              boundingBox: const Rect.fromLTWH(220, 100, 200, 300)),
+          DetectedObject(label: 'Table', confidence: 0.80,
+              boundingBox: const Rect.fromLTWH(480, 100, 150, 200)),
+        ];
+        break;
+
+      case 'tree_side':
+        // Tree on LEFT side — path ahead (center) is CLEAR → should NOT say go right
+        fakeObjects = [
+          DetectedObject(label: 'Tree', confidence: 0.85,
+              boundingBox: const Rect.fromLTWH(10, 60, 180, 300)), // left zone
+        ];
+        break;
+
+      case 'cloth_side':
+        // Cloth hanging on RIGHT — path ahead is CLEAR → should say "path clear, cloth on right"
+        fakeObjects = [
+          DetectedObject(label: 'Cloth', confidence: 0.80,
+              boundingBox: const Rect.fromLTWH(460, 80, 160, 250)), // right zone
+        ];
+        break;
+
+      case 'plant_ahead':
+        // Plant in CENTER — SHOULD warn and give direction
+        fakeObjects = [
+          DetectedObject(label: 'Plant', confidence: 0.82,
+              boundingBox: const Rect.fromLTWH(220, 120, 200, 250)), // center
+        ];
+        break;
+
+      case 'person_ahead':
+        // Person directly in CENTER path
+        fakeObjects = [
+          DetectedObject(label: 'Person', confidence: 0.91,
+              boundingBox: const Rect.fromLTWH(200, 80, 240, 360)), // center
+        ];
+        break;
+
+      case 'clear':
+      default:
+        fakeObjects = [];
+        break;
+    }
+
+
+    _lastSpokenGuidance = ''; // reset so it always speaks during test
+
+    if (fakeObjects.isEmpty) {
+      speak('Path clear. Go straight.');
+      onNavigationGuidance?.call(const NavGuidance(
+        voice: 'Path clear. Go straight.',
+        zone: ObjectZone.center,
+        isDanger: false,
+        objectName: '',
+      ));
+      return;
+    }
+
+    final guidance = _computeNavigationGuidance(fakeObjects, fw, fh);
+    if (guidance != null) {
+      onNavigationGuidance?.call(guidance);
+      speak(guidance.voice);
+      _vibrateForZone(guidance.zone, guidance.isDanger);
+    }
+  }
+
+  // ──────────────────────────────────
   // Scene Analysis & Awareness
   // ──────────────────────────────────
+
 
   /// Analyzes detected objects to determine scene context
   void _analyzeScene(List<DetectedObject> detections) {
@@ -598,18 +1102,31 @@ class VisionLogic {
   void toggleContinuousMode() {
     _continuousMode = !_continuousMode;
     if (_continuousMode) {
-      // Start periodic narration
       _narrationTimer = Timer.periodic(_narrationInterval, (_) {
         if (_currentDetections.isNotEmpty) {
           _announceDetections(_currentDetections);
         }
       });
-      // Announce that continuous mode is on
       speak('Continuous mode activated. I will describe your surroundings.');
     } else {
       _narrationTimer?.cancel();
       _narrationTimer = null;
       speak('Continuous mode deactivated.');
+    }
+  }
+
+  /// Describe current path with spatial directions
+  Future<void> describeNavigation() async {
+    if (_currentDetections.isEmpty) {
+      await speak('Path looks clear. No objects detected ahead.');
+      return;
+    }
+    // Use last known frame width approximation (640 typical)
+    final guidance = _computeNavigationGuidance(_currentDetections, 640);
+    if (guidance != null) {
+      await speak(guidance.voice);
+    } else {
+      await speak('Unable to determine path. Please scan your surroundings.');
     }
   }
 
@@ -743,5 +1260,6 @@ class VisionLogic {
     _cameraInitialized = false;
     _isSpeaking = false;
     _continuousMode = false;
+    _navigationGuidanceActive = false;
   }
 }

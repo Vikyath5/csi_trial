@@ -288,19 +288,9 @@ class _DashboardScreenState extends State<DashboardScreen> {
             Expanded(
               child: _ToolTile(
                 icon: Icons.map_rounded,
-                label: 'Google Maps\nDirections',
+                label: 'Google Maps Directions',
                 color: const Color(0xFF4285F4),
                 onTap: () => _launchURL('https://www.google.com/maps/dir/?api=1'),
-              ),
-            ),
-            const SizedBox(width: NVDimensions.spacingM),
-            // Seeing AI
-            Expanded(
-              child: _ToolTile(
-                icon: Icons.remove_red_eye_rounded,
-                label: 'Seeing AI\nDetection',
-                color: const Color(0xFF0078D4),
-                onTap: () => _launchURL('seeingai://'),
               ),
             ),
           ],

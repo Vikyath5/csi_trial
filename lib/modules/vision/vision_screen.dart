@@ -42,6 +42,8 @@ class _VisionScreenState extends State<VisionScreen>
 
   // ── Navigation Guidance ──
   Timer? _navigationTimer;
+  bool _navGuidanceActive = false;
+  NavGuidance? _currentGuidance;
   int _directionIndex = 0;
   final List<String> _directionPrompts = [
     'Continue straight for 50 meters.',
@@ -58,6 +60,10 @@ class _VisionScreenState extends State<VisionScreen>
 
   // ── Detection history ──
   final List<_DetectionEvent> _detectionHistory = [];
+
+  // ── Debug overlay ──
+  bool _showDebug = true; // ON by default so we can verify
+  String _debugInfo = 'Waiting for detections...';
 
   // ── Animation ──
   late AnimationController _pulseController;
@@ -95,14 +101,23 @@ class _VisionScreenState extends State<VisionScreen>
     // Setup Callbacks
     _logic.onDetectionUpdate = (detections) {
       if (!mounted) return;
-      
-      // Check for navigation destination from global assistant
+
+      // ── Build debug info string ──
+      final labels = detections.map((d) {
+        final box = d.boundingBox != Rect.zero ? '[BOX]' : '[LABEL]';
+        return '$box ${d.displayLabel} ${(d.confidence * 100).toStringAsFixed(0)}%';
+      }).join('\n');
+      final debugStr = detections.isEmpty
+          ? 'NO DETECTIONS'
+          : labels;
+
       final session = context.read<SessionController>();
       if (session.navigationDestination != null && !_isMapMode) {
         _startNavigation(session.navigationDestination!);
       }
 
       setState(() {
+        _debugInfo = debugStr;
         _objectCount = detections.length;
         _detections = detections;
         if (detections.isNotEmpty) {
@@ -124,6 +139,12 @@ class _VisionScreenState extends State<VisionScreen>
           }
         }
       });
+    };
+
+    // Navigation guidance callback ─ updates directional overlay
+    _logic.onNavigationGuidance = (guidance) {
+      if (!mounted) return;
+      setState(() => _currentGuidance = guidance);
     };
 
     // Track speech state for visual feedback
@@ -196,6 +217,9 @@ class _VisionScreenState extends State<VisionScreen>
             if (session.navigationDestination != null) {
               _launchMap(session.navigationDestination!);
             }
+            break;
+          case GlobalCommand.toggleNavigation:
+            _toggleNavGuidance();
             break;
         }
       });
@@ -288,6 +312,15 @@ class _VisionScreenState extends State<VisionScreen>
     setState(() => _continuousMode = _logic.isContinuousMode);
   }
 
+  void _toggleNavGuidance() {
+    final newState = !_navGuidanceActive;
+    _logic.setNavigationGuidance(newState);
+    setState(() {
+      _navGuidanceActive = newState;
+      if (!newState) _currentGuidance = null;
+    });
+  }
+
   void _simulateDetection(String label) async {
     final session = context.read<SessionController>();
     setState(() {
@@ -309,12 +342,15 @@ class _VisionScreenState extends State<VisionScreen>
       body: SafeArea(
         child: GestureDetector(
           behavior: HitTestBehavior.opaque,
-          // onTap removed - handled by Global Assistant
           onLongPress: () async {
-            // Description on long press
             _logic.speak('Describing surroundings.');
             await Vibration.vibrate(duration: 100);
-            _logic.describeScene();
+            // If nav guidance is active, describe navigation direction
+            if (_navGuidanceActive) {
+              _logic.describeNavigation();
+            } else {
+              _logic.describeScene();
+            }
           },
           onHorizontalDragEnd: (details) {
             if (details.primaryVelocity != null) {
@@ -333,10 +369,15 @@ class _VisionScreenState extends State<VisionScreen>
             children: [
               _buildLinearStatusBanner(theme),
               Expanded(flex: 3, child: _buildCameraArea(theme)),
+              if (_navGuidanceActive && _currentGuidance != null)
+                _buildDirectionBanner(_currentGuidance!),
+              // ── LIVE DEBUG PANEL ──
+              if (_showDebug) _buildDebugPanel(),
               _buildToggles(theme, session),
               const SizedBox(height: NVDimensions.spacingM),
             ],
           ),
+
         ),
       ),
     );
@@ -460,6 +501,103 @@ class _VisionScreenState extends State<VisionScreen>
     );
   }
 
+  // ────────────────────────────────
+  // Live Debug Panel
+  // ────────────────────────────────
+  Widget _buildDebugPanel() {
+    return GestureDetector(
+      onTap: () => setState(() => _showDebug = false),
+      child: Container(
+        width: double.infinity,
+        margin: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+        padding: const EdgeInsets.all(10),
+        decoration: BoxDecoration(
+          color: Colors.black87,
+          borderRadius: BorderRadius.circular(10),
+          border: Border.all(color: Colors.greenAccent.withOpacity(0.5), width: 1),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            // Header
+            Row(
+              children: [
+                const Icon(Icons.bug_report, color: Colors.greenAccent, size: 14),
+                const SizedBox(width: 6),
+                const Text('ML KIT OUTPUT  (tap here to hide)',
+                    style: TextStyle(color: Colors.greenAccent, fontSize: 11, fontWeight: FontWeight.bold)),
+                const Spacer(),
+                Text('${_detections.length} items',
+                    style: const TextStyle(color: Colors.white54, fontSize: 10)),
+              ],
+            ),
+            const Divider(color: Colors.white24, height: 8),
+            // Raw detection list
+            Text(
+              _debugInfo,
+              style: const TextStyle(
+                color: Colors.white, fontSize: 11,
+                fontFamily: 'monospace', height: 1.6,
+              ),
+            ),
+            // Current guidance
+            if (_currentGuidance != null) ...[
+              const Divider(color: Colors.white24, height: 8),
+              Text(
+                '🗣 ${_currentGuidance!.voice}',
+                style: const TextStyle(color: Colors.yellowAccent,
+                    fontSize: 11, fontWeight: FontWeight.w600),
+              ),
+            ],
+            const Divider(color: Colors.white24, height: 8),
+            // ── TEST SCENARIO BUTTONS ──
+            const Text('TAP TO TEST NAVIGATION:',
+                style: TextStyle(color: Colors.cyanAccent, fontSize: 10, fontWeight: FontWeight.bold)),
+            const SizedBox(height: 6),
+            Wrap(
+              spacing: 6,
+              runSpacing: 6,
+              children: [
+                _testBtn('🧱 Wall',        'wall',         Colors.orange),
+                _testBtn('🚶 Left',        'person_left',  Colors.blue),
+                _testBtn('🚶 Right',       'person_right', Colors.blue),
+                _testBtn('� Ahead',       'person_ahead', Colors.blue),
+                _testBtn('�🚗 Car Ahead',   'car_ahead',    Colors.red),
+                _testBtn('🌳 Tree Side',   'tree_side',    Colors.green),
+                _testBtn('🪴 Plant Ahead',  'plant_ahead',  Colors.green),
+                _testBtn('� Cloth Side',  'cloth_side',   Colors.purple),
+                _testBtn('🚧 Blocked',     'blocked',      Colors.purple),
+                _testBtn('✅ Clear',       'clear',        Colors.tealAccent),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _testBtn(String label, String scenario, Color color) {
+    return GestureDetector(
+      onTap: () {
+        _logic.testNavScenario(scenario);
+        // Force show guidance state update
+        Future.delayed(const Duration(milliseconds: 200), () {
+          if (mounted) setState(() => _showDebug = true);
+        });
+      },
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+        decoration: BoxDecoration(
+          color: color.withOpacity(0.2),
+          borderRadius: BorderRadius.circular(6),
+          border: Border.all(color: color, width: 1),
+        ),
+        child: Text(label,
+            style: TextStyle(color: color, fontSize: 11, fontWeight: FontWeight.w600)),
+      ),
+    );
+  }
+
   Widget _buildCameraContent(ThemeData theme) {
     if (_cameraLoading) return const Center(child: CircularProgressIndicator(color: NVColors.visionAccent));
     if (_cameraAvailable && _logic.cameraController != null && _logic.cameraController!.value.isInitialized) {
@@ -482,6 +620,101 @@ class _VisionScreenState extends State<VisionScreen>
         ],
       ),
     );
+  }
+
+  // ────────────────────────────────
+  // Direction Banner (Nav Guidance UI)
+  // ────────────────────────────────
+
+  Widget _buildDirectionBanner(NavGuidance guidance) {
+    final isDanger = guidance.isDanger;
+    final Color baseColor = isDanger ? Colors.red : _zoneColor(guidance.zone);
+    final IconData arrowIcon = _zoneArrow(guidance.zone);
+
+    return AnimatedContainer(
+      duration: const Duration(milliseconds: 400),
+      curve: Curves.easeInOut,
+      width: double.infinity,
+      margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+      decoration: BoxDecoration(
+        color: baseColor.withOpacity(isDanger ? 0.25 : 0.15),
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: baseColor, width: isDanger ? 2.5 : 1.5),
+        boxShadow: [
+          BoxShadow(
+            color: baseColor.withOpacity(0.3),
+            blurRadius: 8,
+            spreadRadius: isDanger ? 2 : 0,
+          )
+        ],
+      ),
+      child: Row(
+        children: [
+          // Zone indicator – three zone slots
+          _buildZoneIndicator(guidance.zone, isDanger),
+          const SizedBox(width: 12),
+          // Arrow icon
+          Icon(arrowIcon, color: baseColor, size: 36),
+          const SizedBox(width: 12),
+          // Guidance text
+          Expanded(
+            child: Text(
+              guidance.voice,
+              style: TextStyle(
+                color: Colors.white,
+                fontSize: 13,
+                fontWeight: isDanger ? FontWeight.bold : FontWeight.w500,
+                height: 1.4,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildZoneIndicator(ObjectZone zone, bool isDanger) {
+    Color active = isDanger ? Colors.red : Colors.greenAccent;
+    Color inactive = Colors.white12;
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        _zoneBox(zone == ObjectZone.left ? active : inactive),
+        const SizedBox(width: 3),
+        _zoneBox(zone == ObjectZone.center ? active : inactive, tall: true),
+        const SizedBox(width: 3),
+        _zoneBox(zone == ObjectZone.right ? active : inactive),
+      ],
+    );
+  }
+
+  Widget _zoneBox(Color color, {bool tall = false}) =>
+      Container(
+        width: 10,
+        height: tall ? 32 : 24,
+        decoration: BoxDecoration(
+          color: color,
+          borderRadius: BorderRadius.circular(3),
+        ),
+      );
+
+  Color _zoneColor(ObjectZone zone) {
+    switch (zone) {
+      case ObjectZone.left:    return Colors.orange;
+      case ObjectZone.right:   return Colors.blue;
+      case ObjectZone.center:  return Colors.amber;
+      case ObjectZone.unknown: return Colors.tealAccent;
+    }
+  }
+
+  IconData _zoneArrow(ObjectZone zone) {
+    switch (zone) {
+      case ObjectZone.left:    return Icons.arrow_back_rounded;
+      case ObjectZone.right:   return Icons.arrow_forward_rounded;
+      case ObjectZone.center:  return Icons.arrow_upward_rounded;
+      case ObjectZone.unknown: return Icons.explore_rounded;
+    }
   }
 
   Widget _buildDetectionBanner(ThemeData theme) {
@@ -568,6 +801,14 @@ class _VisionScreenState extends State<VisionScreen>
             label: 'Guide',
             isActive: _continuousMode,
             onTap: _toggleContinuousMode,
+          ),
+          _buildToggle(
+            icon: _navGuidanceActive
+                ? Icons.assistant_navigation
+                : Icons.navigation_outlined,
+            label: 'Navigate',
+            isActive: _navGuidanceActive,
+            onTap: _toggleNavGuidance,
           ),
         ],
       ),
