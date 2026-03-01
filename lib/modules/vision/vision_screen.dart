@@ -398,9 +398,7 @@ class _VisionScreenState extends State<VisionScreen>
                   )
                 ),
                 Text(
-                  _isMapMode 
-                    ? 'Scan signs or Double tap to navigate' 
-                    : '$_sceneDescription ($_objectCount items)',
+                  _isMapMode || _logic.isNavigationMode ? 'Navigating route' : '$_sceneDescription ($_objectCount items)',
                   style: theme.textTheme.bodySmall?.copyWith(color: NVColors.textSecondary)
                 ),
               ],
@@ -565,9 +563,19 @@ class _VisionScreenState extends State<VisionScreen>
           ),
           _buildToggle(
             icon: _continuousMode ? Icons.record_voice_over : Icons.voice_over_off,
-            label: 'Guide',
+            label: 'Speak',
             isActive: _continuousMode,
             onTap: _toggleContinuousMode,
+          ),
+          _buildToggle(
+            icon: _logic.isNavigationMode ? Icons.explore : Icons.explore_off,
+            label: 'Nav',
+            isActive: _logic.isNavigationMode,
+            onTap: () {
+              setState(() {
+                _logic.toggleNavigationMode();
+              });
+            },
           ),
         ],
       ),

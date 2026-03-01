@@ -82,10 +82,13 @@ class VisionLogic {
   DateTime _lastAnnouncement = DateTime.now();
   DateTime _lastDangerAnnouncement = DateTime.now();
 
-  // ── Continuous narration mode ──
   bool _continuousMode = false;
   Timer? _narrationTimer;
-  static const Duration _narrationInterval = Duration(seconds: 3);
+  static const Duration _narrationInterval = Duration(seconds: 4);
+
+  // ── Navigation Mode ──
+  bool _navigationMode = false;
+  String _navInstruction = 'Path clear. Walk straight.';
 
   // ── Detection state ──
   List<DetectedObject> _currentDetections = [];
@@ -100,12 +103,14 @@ class VisionLogic {
   bool get isCameraReady => _cameraInitialized;
   bool get isDetectionActive => _detectionActive;
   bool get isContinuousMode => _continuousMode;
+  bool get isNavigationMode => _navigationMode;
   bool get isSpeaking => _isSpeaking;
   bool get useYOLO => _useYOLO;
   bool get yoloLoaded => _yoloLoaded;
   List<DetectedObject> get currentDetections => _currentDetections;
   SceneContext get currentScene => _currentScene;
   String get sceneDescription => _sceneDescription;
+  String get navInstruction => _navInstruction;
 
   // ──────────────────────────────────
   // Camera Initialization
@@ -131,7 +136,7 @@ class VisionLogic {
         }
       }
 
-      // Initialize camera controller
+      // Initialize camera controller — medium for good ML Kit accuracy
       cameraController = CameraController(
         selectedCamera,
         ResolutionPreset.medium,
@@ -255,9 +260,9 @@ class VisionLogic {
 
   /// Process a single camera frame for object detection
   Future<void> _processImage(CameraImage image) async {
-    // Throttle: only process every 5th frame to reduce load
+    // Throttle: process every 4th frame — balance speed vs accuracy
     _frameCount++;
-    if (_frameCount % 5 != 0) return;
+    if (_frameCount % 4 != 0) return;
 
     if (_isDetecting || !_detectionActive) return;
     if (!_useYOLO && _objectDetector == null && _imageLabeler == null) return;
@@ -302,7 +307,7 @@ class VisionLogic {
           final objects = await _objectDetector!.processImage(inputImage);
           for (final obj in objects) {
             for (final label in obj.labels) {
-              if (label.confidence >= 0.4) {
+              if (label.confidence >= 0.6) {
                 detections.add(DetectedObject(
                   label: label.text,
                   confidence: label.confidence,
@@ -313,17 +318,17 @@ class VisionLogic {
           }
         }
 
-        // 2. Run Image Labeler (for "many more" objects like cars, plants, signs)
-        if (_imageLabeler != null) {
+        // 2. Run Image Labeler ONLY if NOT in navigation mode
+        // (labeler is slow and has no bounding boxes — useless for directions)
+        if (_imageLabeler != null && !_navigationMode) {
           final labels = await _imageLabeler!.processImage(inputImage);
           for (final label in labels) {
             if (label.confidence >= 0.5) {
-              // Add if not already in detections
               if (!detections.any((d) => d.label.toLowerCase() == label.label.toLowerCase())) {
                 detections.add(DetectedObject(
                   label: label.label,
                   confidence: label.confidence,
-                  boundingBox: Rect.zero, // Labels don't have boxes
+                  boundingBox: Rect.zero,
                 ));
               }
             }
@@ -333,21 +338,38 @@ class VisionLogic {
 
       // Update state
       _currentDetections = detections;
-      _analyzeScene(detections);
+      _analyzeScene(detections, image.width.toDouble(), image.height.toDouble());
+      _calculateNavigation(detections, image.width.toDouble());
       onDetectionUpdate?.call(detections);
 
-      // 1. URGENT SAFETY: Always speak if danger objects (car, truck) are detected
-      // even if continuous mode is OFF.
-      final dangerObjects = detections.where((d) => 
-        ['car', 'truck', 'bus', 'motorcycle', 'bicycle'].contains(d.label.toLowerCase())
-      ).toList();
+      // 1. URGENT SAFETY: Only warn about NEARBY danger objects (within ~8-10m)
+      final double frameArea = image.width * image.height.toDouble();
+      const double dangerMinArea = 0.05; // 5% of frame = within ~8-10m
+
+      final dangerObjects = detections.where((d) {
+        if (!['car', 'truck', 'bus', 'motorcycle', 'bicycle'].contains(d.label.toLowerCase())) return false;
+        if (d.boundingBox == Rect.zero) return false;
+        final boxArea = d.boundingBox.width * d.boundingBox.height;
+        return (boxArea / frameArea) >= dangerMinArea;
+      }).toList();
 
       final now = DateTime.now();
-      if (dangerObjects.isNotEmpty && now.difference(_lastDangerAnnouncement) > const Duration(seconds: 4)) {
+      if (dangerObjects.isNotEmpty && now.difference(_lastDangerAnnouncement) > const Duration(seconds: 2)) {
         _lastDangerAnnouncement = now;
+        final box = dangerObjects.first.boundingBox;
         final name = dangerObjects.first.displayLabel;
-        speak('Caution! $name nearby.');
-        Vibration.vibrate(duration: 500); // Strong haptic for danger
+        final cx = box.center.dx;
+        final mid = image.width / 2.0;
+        String dir = 'ahead';
+        if (cx < mid - (image.width * 0.15)) dir = 'on your left';
+        else if (cx > mid + (image.width * 0.15)) dir = 'on your right';
+
+        if (_navigationMode) {
+          speak('Caution! Moving obstacle $dir. Stop or change direction.');
+        } else {
+          speak('Caution! $name $dir.');
+        }
+        Vibration.vibrate(duration: 500);
       }
 
       // 2. Continuous mode narration
@@ -424,7 +446,8 @@ class VisionLogic {
   // ──────────────────────────────────
 
   /// Analyzes detected objects to determine scene context
-  void _analyzeScene(List<DetectedObject> detections) {
+  /// Only considers NEARBY objects (big bounding box) for accurate speech
+  void _analyzeScene(List<DetectedObject> detections, double imgW, double imgH) {
     final labels = detections.map((d) => d.label.toLowerCase()).toSet();
 
     // Determine scene based on detected objects
@@ -440,14 +463,12 @@ class VisionLogic {
       'potted plant', 'teddy bear', 'pillow',
     };
 
-    // Road/outdoor indicators
     final roadObjects = {
       'car', 'truck', 'bus', 'motorcycle', 'bicycle', 'traffic light',
       'stop sign', 'parking meter', 'fire hydrant', 'bench',
       'dog', 'cat', 'bird', 'horse',
     };
 
-    // Outdoor indicators
     final outdoorObjects = {
       'tree', 'person', 'bird', 'bench', 'dog', 'cat', 'umbrella',
       'kite', 'sports ball', 'frisbee', 'skateboard', 'surfboard',
@@ -467,38 +488,160 @@ class VisionLogic {
       scene = SceneContext.indoor;
     }
 
-    // Build description
-    if (detections.isEmpty) {
-      description = 'No objects detected. Point the camera at your surroundings.';
+    // Filter to only nearby objects for speech (big bounding boxes)
+    final double frameArea = imgW * imgH;
+    const double minArea = 0.02; // 2% of frame = within ~10m
+
+    final nearbyDetections = detections.where((d) {
+      if (d.boundingBox == Rect.zero) return true; // labeler results have no box, keep them
+      return (d.boundingBox.width * d.boundingBox.height) / frameArea >= minArea;
+    }).toList();
+
+    // Build description using only nearby objects with direction
+    if (nearbyDetections.isEmpty) {
+      description = 'No nearby objects detected.';
     } else {
-      final objectNames = detections
-          .map((d) => d.displayLabel)
-          .toSet()
-          .take(5)
-          .join(', ');
+      final objectParts = <String>[];
+      final seen = <String>{};
+      for (final d in nearbyDetections) {
+        final name = d.displayLabel;
+        if (seen.contains(name.toLowerCase())) continue;
+        seen.add(name.toLowerCase());
+        if (d.boundingBox != Rect.zero) {
+          objectParts.add('$name ${_getPosition(d.boundingBox, imgW)}');
+        } else {
+          objectParts.add(name);
+        }
+        if (objectParts.length >= 4) break; // Max 4 objects for clarity
+      }
+      final objectList = objectParts.join(', ');
 
       switch (scene) {
         case SceneContext.home:
-          description = 'You appear to be at home. I can see: $objectNames.';
+          description = 'At home. $objectList.';
           break;
         case SceneContext.road:
-          description = 'You appear to be near a road. I can see: $objectNames. Please be careful!';
+          description = 'Near road. $objectList. Be careful!';
           break;
         case SceneContext.outdoor:
-          description = 'You appear to be outdoors. I can see: $objectNames.';
+          description = 'Outdoors. $objectList.';
           break;
         case SceneContext.indoor:
-          description = 'You appear to be indoors. I can see: $objectNames.';
+          description = 'Indoors. $objectList.';
           break;
         case SceneContext.unknown:
-          description = 'I can see: $objectNames.';
+          description = '$objectList.';
           break;
       }
     }
 
     _currentScene = scene;
     _sceneDescription = description;
-    onSceneUpdate?.call(description);
+    
+    if (!_navigationMode) {
+      onSceneUpdate?.call(description);
+    }
+  }
+
+  /// Returns position string for an object based on its bounding box center
+  String _getPosition(Rect box, double imageWidth) {
+    final cx = box.center.dx;
+    if (cx < imageWidth * 0.33) {
+      return 'on your left';
+    } else if (cx > imageWidth * 0.66) {
+      return 'on your right';
+    } else {
+      return 'ahead';
+    }
+  }
+
+  /// Advanced navigation: only considers NEARBY obstacles (approx 5-10m)
+  /// Uses bounding box area as a proxy for distance:
+  ///   Big box = close object → relevant for navigation
+  ///   Small box = far object → ignore it
+  void _calculateNavigation(List<DetectedObject> detections, double imageWidth) {
+    if (detections.isEmpty) {
+      _navInstruction = 'Path clear. Walk straight.';
+      if (_navigationMode) onSceneUpdate?.call(_navInstruction);
+      return;
+    }
+
+    // Only keep objects with bounding boxes
+    final withBoxes = detections.where((d) => d.boundingBox != Rect.zero).toList();
+    if (withBoxes.isEmpty) {
+      _navInstruction = 'Path clear. Walk straight.';
+      if (_navigationMode) onSceneUpdate?.call(_navInstruction);
+      return;
+    }
+
+    // ── DISTANCE FILTER ──
+    // Only consider objects within ~8-10 meters
+    // Bounding box area >= 5% of frame means the object is close enough to matter
+    final double frameArea = imageWidth * imageWidth;
+    const double minAreaRatio = 0.05;
+
+    final nearbyObstacles = withBoxes.where((obs) {
+      final boxArea = obs.boundingBox.width * obs.boundingBox.height;
+      return (boxArea / frameArea) >= minAreaRatio;
+    }).toList();
+
+    if (nearbyObstacles.isEmpty) {
+      _navInstruction = 'Path clear. Walk straight.';
+      if (_navigationMode) onSceneUpdate?.call(_navInstruction);
+      return;
+    }
+
+    // ── ZONE CLASSIFICATION ──
+    // Divide frame into 3 vertical zones: left / center / right
+    final double leftBound = imageWidth * 0.33;
+    final double rightBound = imageWidth * 0.66;
+
+    bool leftBlocked = false;
+    bool centerBlocked = false;
+    bool rightBlocked = false;
+    double closestArea = 0; // Tracks how close the nearest center obstacle is
+
+    for (final obs in nearbyObstacles) {
+      final cx = obs.boundingBox.center.dx;
+      final areaRatio = (obs.boundingBox.width * obs.boundingBox.height) / frameArea;
+
+      if (cx < leftBound) {
+        leftBlocked = true;
+      } else if (cx > rightBound) {
+        rightBlocked = true;
+      } else {
+        centerBlocked = true;
+        if (areaRatio > closestArea) closestArea = areaRatio;
+      }
+    }
+
+    // ── BUILD DIRECTION ──
+    if (!centerBlocked) {
+      if (leftBlocked && rightBlocked) {
+        _navInstruction = 'Obstacles on both sides. Walk straight carefully.';
+      } else if (leftBlocked) {
+        _navInstruction = 'Obstacle on your left. Keep right and walk straight.';
+      } else if (rightBlocked) {
+        _navInstruction = 'Obstacle on your right. Keep left and walk straight.';
+      } else {
+        _navInstruction = 'Path clear. Walk straight.';
+      }
+    } else {
+      // Center is blocked — need to turn
+      // closestArea > 0.10 means very close (within ~2-3m), else ~5-10m
+      final String proximity = closestArea > 0.10 ? 'Very close' : 'Ahead';
+      if (!leftBlocked && !rightBlocked) {
+        _navInstruction = '$proximity obstacle ahead. Turn left or right.';
+      } else if (!leftBlocked) {
+        _navInstruction = '$proximity obstacle ahead and right. Turn left now.';
+      } else if (!rightBlocked) {
+        _navInstruction = '$proximity obstacle ahead and left. Turn right now.';
+      } else {
+        _navInstruction = 'Blocked in all directions. Stop. Turn around.';
+      }
+    }
+
+    if (_navigationMode) onSceneUpdate?.call(_navInstruction);
   }
 
   // ──────────────────────────────────
@@ -509,7 +652,7 @@ class VisionLogic {
   Future<void> initializeTTS() async {
     try {
       await _tts.setLanguage('en-US');
-      await _tts.setSpeechRate(0.4);
+      await _tts.setSpeechRate(0.55); // Faster speech for quicker guidance
       await _tts.setVolume(1.0);
       await _tts.setPitch(1.0);
 
@@ -525,25 +668,26 @@ class VisionLogic {
     }
   }
 
-  /// Announces detected objects via TTS
+  /// Announces detected objects via TTS — speaks each object with its position
   Future<void> _announceDetections(List<DetectedObject> detections) async {
     if (!_ttsReady) return;
 
-    // Filter detections for safety
-    final dangerObjects = detections.where((d) => 
-      ['car', 'truck', 'bus', 'motorcycle', 'bicycle'].contains(d.label.toLowerCase())
-    ).toList();
+    // Stop any ongoing speech so we always announce latest info
+    await _tts.stop();
+    _isSpeaking = false;
 
     String message = '';
-    if (dangerObjects.isNotEmpty) {
-      final name = dangerObjects.first.displayLabel;
-      message = 'Caution! $name nearby. ';
+
+    if (_navigationMode) {
+      // In nav mode just speak the direction
+      message = _navInstruction;
     } else {
-      // Don't interrupt if already speaking normal scene info
-      if (_isSpeaking) return;
+      // In normal mode, speak objects with positions
+      // Use the already-built scene description which now has positions
+      message = _sceneDescription;
     }
 
-    message += _sceneDescription;
+    if (message.trim().isEmpty) return;
 
     try {
       _isSpeaking = true;
@@ -613,11 +757,28 @@ class VisionLogic {
     }
   }
 
+  /// Toggle navigation mode for blind users
+  void toggleNavigationMode() {
+    _navigationMode = !_navigationMode;
+    if (_navigationMode) {
+      speak('Navigation mode activated. Providing directional guidance.');
+      onSceneUpdate?.call(_navInstruction);
+    } else {
+      speak('Navigation mode deactivated.');
+      onSceneUpdate?.call(_sceneDescription);
+    }
+  }
+
   /// Manually trigger scene description
   Future<void> describeScene() async {
     // Immediate haptic feedback
     Vibration.vibrate(duration: 100);
     
+    if (_navigationMode) {
+      await speak(_navInstruction);
+      return;
+    }
+
     if (_currentDetections.isEmpty) {
       if (_sceneDescription.isNotEmpty && _sceneDescription != 'No objects detected. Point the camera at your surroundings.') {
          await speak('Wait. Previously I saw: $_sceneDescription');
@@ -743,5 +904,6 @@ class VisionLogic {
     _cameraInitialized = false;
     _isSpeaking = false;
     _continuousMode = false;
+    _navigationMode = false;
   }
 }
