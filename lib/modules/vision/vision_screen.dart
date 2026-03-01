@@ -439,7 +439,7 @@ class _VisionScreenState extends State<VisionScreen>
                   )
                 ),
                 Text(
-                  _isMapMode || _logic.isNavigationMode ? 'Navigating route' : '$_sceneDescription ($_objectCount items)',
+                  _isMapMode || _logic.isNavigationGuidanceActive ? 'Navigating route' : '$_sceneDescription ($_objectCount items)',
                   style: theme.textTheme.bodySmall?.copyWith(color: NVColors.textSecondary)
                 ),
               ],
@@ -796,9 +796,15 @@ class _VisionScreenState extends State<VisionScreen>
           ),
           _buildToggle(
             icon: _continuousMode ? Icons.record_voice_over : Icons.voice_over_off,
-            label: 'Speak',
+            label: 'Guide',
             isActive: _continuousMode,
             onTap: _toggleContinuousMode,
+          ),
+          _buildToggle(
+            icon: _navGuidanceActive ? Icons.navigation : Icons.navigation_outlined,
+            label: 'Navigate',
+            isActive: _navGuidanceActive,
+            onTap: _toggleNavGuidance,
           ),
         ],
       ),
